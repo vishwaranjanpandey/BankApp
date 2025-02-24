@@ -1,0 +1,157 @@
+@Library ('My-shared-libary') _
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'action', choices: 'create\ndelete', description: 'Choose create/Destroy')
+        string(name: 'aws_account_id', description: " AWS Account ID", defaultValue: '339436574330')
+        string(name: 'Region', description: "Region of ECR", defaultValue: 'ap-south-1')
+        string(name: 'ECR_REPO_NAME', description: "name of the ECR", defaultValue: 'vishwa')
+        choice(name: 'DEPLOY_ENV', choices: ['blue', 'green'], description: 'Choose which environment to deploy: Blue or Green')
+        booleanParam(name: 'SWITCH_TRAFFIC', defaultValue: false, description: 'Switch traffic between Blue and Green')
+    }
+    tools {
+        jdk 'jdk17'
+        maven 'maven3'
+    }
+    
+    environment {
+        SCANNER_HOME=tool 'sonar-scanner'
+        KUBE_NAMESPACE = 'webapps'
+    }
+    
+    stages {
+        stage ('git checkout') {
+            when { expression {  params.action == 'create' } }
+            steps {
+                gitCheckout (
+                branch: 'master', url: 'https://github.com/vishwaranjanpandey/BankApp.git'
+                )
+            }
+        }
+        stage ('code compile') {
+            when { expression { params.action == 'create' } }
+            steps {
+                script {
+                mvnCompile ()
+                }
+            }
+        }
+        stage ("code Test") {
+        when { expression { params.action == 'create'} }
+        steps {
+            script {
+                mvnTest ()
+                }
+            }
+        }
+        stage ("SonarQube Analysis") {
+        when { expression { params.action == 'create'} }
+        steps {
+            script {
+                staticCodeAnalysis()
+                }
+            }
+        }
+        stage ("code package") {
+        when { expression { params.action == 'create'} }
+        steps {
+            script {
+                mvnPackage()
+                }
+            }
+        }
+        stage ("code deploy to nexus") {
+        when { expression { params.action == 'create'} }
+        steps {
+            script {
+                nexusDeploy()
+                }
+            }
+        }
+        stage ("Docker Image Build : ECR'") {
+        when { expression { params.action == 'create'} }
+        steps {
+            script {
+                dockerBuild("${params.aws_account_id}","${params.Region}","${params.ECR_REPO_NAME}")
+                }
+            }
+        }
+        stage ("Docker Image Push : ECR'") {
+        when { expression { params.action == 'create'} }
+        steps {
+            script {
+                DockerImagePush("${params.aws_account_id}","${params.Region}","${params.ECR_REPO_NAME}")
+                }
+            }
+        }
+         stage('Deploy MySQL Deployment and Service') {
+            steps {
+                script {
+                    withKubeConfig(caCertificate: '', clusterName: 'EKS-1', contextName: '', credentialsId: 'k8-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://8C7BEBF149B43625F15A5E8A175FCCFA.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh "kubectl apply -f mysql-ds.yml -n ${KUBE_NAMESPACE}"  // Ensure you have the MySQL deployment YAML ready
+                    }
+                }
+            }
+        }
+        stage('Deploy SVC-APP') {
+            steps {
+                script {
+                    withKubeConfig(caCertificate: '', clusterName: 'EKS-1', contextName: '', credentialsId: 'k8-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://8C7BEBF149B43625F15A5E8A175FCCFA.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh """ if ! kubectl get svc bankapp-service -n ${KUBE_NAMESPACE}; then
+                                kubectl apply -f bankapp-service.yml -n ${KUBE_NAMESPACE}
+                              fi
+                        """
+                   }
+                }
+            }
+        }
+        stage('Deploy to kubernetes') {
+            steps {
+                script {
+                    def deploymentfile = ""
+                    if (params.DEPLOY_ENV == 'blue') {
+                        deploymentfile = 'app-deployment-blue.yml'
+                    }
+                    else {
+                        deploymentfile = 'app-deployment-green.yml'
+                    }
+                    withKubeConfig(caCertificate: '', clusterName: 'EKS-1', contextName: '', credentialsId: 'k8-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://8C7BEBF149B43625F15A5E8A175FCCFA.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh """ kubectl apply -f ${deploymentfile} -n ${KUBE_NAMESPACE}"""
+                    }
+                }
+            }
+        }
+        stage ('switch traffic between blue & green Env') {
+            
+            when { expression { return params.SWITCH_TRAFFIC } }
+            
+            steps {
+                script { 
+                    def newEnv = params.DEPLOY_ENV
+                    // Always switch traffic based on DEPLOY_ENV
+                    withKubeConfig(caCertificate: '', clusterName: 'EKS-1', contextName: '', credentialsId: 'k8-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://8C7BEBF149B43625F15A5E8A175FCCFA.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh '''
+                            kubectl patch service bankapp-service -p "{\\"spec\\": {\\"selector\\": {\\"app\\": \\"bankapp\\", \\"version\\": \\"''' + newEnv + '''\\"}}}" -n ${KUBE_NAMESPACE}
+                        '''
+                        
+                    }
+                    echo "traffic has been switched to the ${newEnv} environment"
+                }
+            }
+        }
+        stage ('Verify Deployment') {
+            steps {
+                script {
+                    def verifyEnv = params.DEPLOY_ENV 
+                    withKubeConfig(caCertificate: '', clusterName: 'EKS-1', contextName: '', credentialsId: 'k8-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://8C7BEBF149B43625F15A5E8A175FCCFA.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh """ 
+                        kubectl get pods -l version=${verifyEnv} -n ${KUBE_NAMESPACE}
+                         kubectl get svc bankapp-service -n ${KUBE_NAMESPACE}
+                         """
+                    }
+                }
+            }
+        }
+    }
+}
